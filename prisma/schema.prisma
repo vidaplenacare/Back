@@ -1,0 +1,489 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum CategoriaProfissional {
+  cuidador
+  enfermeiro
+  fisioterapeuta
+  acompanhante
+}
+
+enum NivelOcupacao {
+  livre
+  parcial
+  lotado
+}
+
+// O perfil PÚBLICO do cuidador — é o que o membro vê e contrata no catálogo.
+//
+// `usuarioId` liga esse perfil à conta real que o cuidador usa para entrar no app (`Usuario` →
+// `Cuidador`). Sem essa ligação não havia como autorizar as ações do lado do cuidador ("esta
+// solicitação é deste cuidador?"), que era o gap de identidade documentado — resolvido em
+// 2026-09-10. É opcional porque os 4 perfis seedados (prof-1..prof-4) são demonstração e não
+// pertencem a ninguém; perfil criado pelo app sempre tem dono. `@unique`: uma conta tem no
+// máximo um perfil público.
+model Profissional {
+  id              String                @id
+  usuarioId       String?               @unique
+  usuario         Usuario?              @relation(fields: [usuarioId], references: [id], onDelete: SetNull)
+  nome            String
+  especialidade   String
+  categoria       CategoriaProfissional
+  experiencia     String
+  avaliacao       Float
+  totalAvaliacoes Int
+  foto            String
+  nivelOcupacao   NivelOcupacao
+  bio             String
+  formacao        String
+  areasAtuacao    String[]
+  disponibilidade String
+  diasDisponiveis Int[]
+  horarioInicio   String
+  horarioFim      String
+  valorVisita     Float
+  telefone        String
+
+  solicitacoes Solicitacao[]
+
+  @@map("profissionais")
+}
+
+enum StatusSolicitacao {
+  pendente
+  aceita
+  em_andamento
+  concluida
+  recusada
+  cancelada
+}
+
+// Uma contratação: a faixa de horário que o membro reservou na agenda do profissional.
+// `id` não tem @default de propósito: a linha de teste usa o mesmo id do mock local do app
+// (`sol-1`) para servir de ponte entre os dois lados enquanto não há identidade real ligando-os.
+//
+// `usuarioId` é opcional só por causa dessa linha-ponte (que não tem dono). Toda solicitação
+// criada pelo app autenticado preenche o dono; `membroNome` continua para exibição rápida e para
+// as linhas antigas sem conta associada.
+//
+// ⚠️ Duas reservas do mesmo profissional não podem se sobrepor no tempo. Isso é garantido por uma
+// constraint EXCLUDE (`solicitacoes_sem_sobreposicao`) criada na migration
+// `20260910_agenda_pagamentos` — o Prisma não representa EXCLUDE no schema, então ela NÃO aparece
+// aqui e não deve ser removida do banco ao rodar `prisma migrate`. Ver BD/README.md.
+model Solicitacao {
+  id              String            @id
+  cuidadorId      String
+  cuidador        Profissional      @relation(fields: [cuidadorId], references: [id])
+  usuarioId       String?
+  usuario         Usuario?          @relation(fields: [usuarioId], references: [id], onDelete: SetNull)
+  membroNome      String
+  status          StatusSolicitacao @default(aceita)
+  observacoes     String?
+  ultimaLatitude  Float?
+  ultimaLongitude Float?
+  atualizadoEm    DateTime?
+  criadoEm        DateTime          @default(now())
+  pings           LocalizacaoPing[]
+  pagamento       Pagamento?
+
+  // Faixa contratada (o membro escolhe "de que hora até que hora", ver DEV-NOTES.md 2026-09-10).
+  // `inicioEm` é também o horário que dispara o aviso de 30min e o início automático do
+  // compartilhamento de GPS aos 15min (ver DEV-NOTES.md 2026-07-31) — antes chamado
+  // `dataHoraAgendada`, renomeado por ser a mesma coisa.
+  inicioEm DateTime
+  fimEm    DateTime
+
+  // Preço congelado no momento da contratação: o valor/hora do profissional pode mudar depois, mas
+  // o que foi combinado com este membro não muda. `valorTotal` = horas da faixa × `valorHora`.
+  valorHora  Float
+  valorTotal Float
+
+  avisoEnviadoEm             DateTime?
+  compartilhamentoAutorizado Boolean   @default(false)
+
+  // Selfie que o profissional tira na hora ao deslizar "iniciar" (verificação do rosto, fluxo
+  // definido pelo usuário em 2026-09-30). É comparada com Usuario.fotoPerfil (a foto da verificação
+  // profissional) em src/lib/verificacaoFacial.ts — ainda provisório, sem API facial — e o membro
+  // vê as duas lado a lado na Home. Guarda a chave do arquivo, não a imagem.
+  selfieInicio   String?
+  selfieInicioEm DateTime?
+
+  avaliacoes Avaliacao[]
+
+  @@index([cuidadorId, inicioEm])
+  @@map("solicitacoes")
+}
+
+enum AutorAvaliacao {
+  membro
+  cuidador
+}
+
+// Avaliação de um atendimento CONCLUÍDO (2026-09-30). Cada ponta avalia a outra uma vez:
+// `membro` avalia o cuidador (entra na nota do catálogo, `Profissional.avaliacao`) e `cuidador`
+// avalia a família. As duas aparecem para os dois lados. Antes disto, avaliar só guardava no
+// celular de quem avaliou — ninguém mais via.
+model Avaliacao {
+  id            String         @id @default(cuid())
+  solicitacaoId String
+  solicitacao   Solicitacao    @relation(fields: [solicitacaoId], references: [id], onDelete: Cascade)
+  autor         AutorAvaliacao
+  nota          Int
+  comentario    String?
+  criadoEm      DateTime       @default(now())
+
+  @@unique([solicitacaoId, autor])
+  @@map("avaliacoes")
+}
+
+enum FormaPagamento {
+  pix
+  cartao
+}
+
+// Ciclo do dinheiro no modelo de garantia (decidido em 2026-09-10, ver DEV-NOTES.md):
+// `pendente` (aceita, esperando o membro pagar) → `pago` (retido pela plataforma, a visita é
+// liberada) → `liberado` (atendimento concluído, virou saldo do cuidador). `estornado` cobre
+// cancelamento/devolução.
+// `cancelado` (2026-09-30): solicitação encerrada (recusada/cancelada) SEM ter sido paga — a
+// cobrança deixa de existir. Antes esse pagamento ficava `pendente` para sempre e o app do membro
+// mostrava "pagamento pendente" de pedido recusado. Ver src/lib/encerrarPagamento.ts.
+enum StatusPagamento {
+  pendente
+  pago
+  liberado
+  estornado
+  cancelado
+}
+
+// Cobrança de uma contratação. Uma por solicitação (`@unique`): o valor é o da faixa contratada,
+// copiado de `Solicitacao.valorTotal` no momento da cobrança.
+// `asaasCobrancaId` fica vazio enquanto a integração com a Asaas não existe (hoje o app usa um
+// mock isolado, ver INTEGRACOES-EXTERNAS.md #9) — é o campo que amarra esta linha à cobrança real.
+model Pagamento {
+  id              String          @id @default(cuid())
+  solicitacaoId   String          @unique
+  solicitacao     Solicitacao     @relation(fields: [solicitacaoId], references: [id], onDelete: Cascade)
+  valor           Float
+  // Quanto do `valor` vira saldo do cuidador, gravado no momento da liberação (desconta a
+  // comissão da plataforma, PLATAFORMA_COMISSAO_PERCENTUAL). Nulo = linha liberada antes da
+  // comissão existir, conta como o valor inteiro.
+  valorRepasse    Float?
+  forma           FormaPagamento?
+  status          StatusPagamento @default(pendente)
+  pagoEm          DateTime?
+  liberadoEm      DateTime?
+  asaasCobrancaId String?         @unique
+  // Página de pagamento da própria Asaas — é por ela que o membro paga com cartão (o número do
+  // cartão nunca passa pelo nosso backend).
+  asaasUrlPagamento String?
+  criadoEm        DateTime        @default(now())
+  atualizadoEm    DateTime        @updatedAt
+
+  @@index([status])
+  @@map("pagamentos")
+}
+
+enum StatusResgate {
+  processando
+  concluido
+  falhou
+}
+
+// Saque do cuidador: leva para a chave Pix dele o saldo já liberado (pagamentos com status
+// `liberado` que ainda não foram sacados). Aponta para `Cuidador` (conta real, que tem a chave
+// Pix), não para `Profissional` (catálogo). `asaasTransferenciaId` é o gancho para a transferência
+// real quando a Asaas for integrada.
+model Resgate {
+  id                   String        @id @default(cuid())
+  cuidadorId           String
+  cuidador             Cuidador      @relation(fields: [cuidadorId], references: [id], onDelete: Cascade)
+  valor                Float
+  chavePix             String
+  status               StatusResgate @default(processando)
+  asaasTransferenciaId String?       @unique
+  motivoFalha          String?
+  criadoEm             DateTime      @default(now())
+  concluidoEm          DateTime?
+
+  @@index([cuidadorId, criadoEm])
+  @@map("resgates")
+}
+
+// Cada evento de webhook da Asaas processado, pelo id do evento (`evt_...`). A Asaas pode reenviar
+// o mesmo evento (timeout, retry) — gravar o id na MESMA transação que aplica o efeito é o que
+// garante que ele só é aplicado uma vez.
+model WebhookAsaasEvento {
+  id          String   @id
+  evento      String
+  recebidoEm  DateTime @default(now())
+
+  @@map("webhook_asaas_eventos")
+}
+
+model LocalizacaoPing {
+  id            String      @id @default(cuid())
+  solicitacaoId String
+  solicitacao   Solicitacao @relation(fields: [solicitacaoId], references: [id], onDelete: Cascade)
+  latitude      Float
+  longitude     Float
+  criadoEm      DateTime    @default(now())
+
+  @@index([solicitacaoId, criadoEm])
+  @@map("localizacao_pings")
+}
+
+// Groundwork para push notification remota (ver INTEGRACOES-EXTERNAS.md #1) — hoje só guarda o
+// token; enviar de fato via API da Expo ainda não está implementado (não dá pra testar em Expo Go
+// no Android, precisa de development build).
+model PushToken {
+  id       String   @id @default(cuid())
+  token    String   @unique
+  criadoEm DateTime @default(now())
+
+  @@map("push_tokens")
+}
+
+enum CategoriaCuidador {
+  cuidador
+  tecnico
+  enfermeiro
+}
+
+enum StatusVerificacaoCadastro {
+  em_analise
+  aprovado
+  reprovado
+}
+
+enum TipoDocumentoCadastro {
+  rg_cnh
+  comprovante_endereco
+  antecedentes_criminais
+  certificado_cuidador
+  coren_comprovante
+  diploma
+  situacao_cadastral
+}
+
+// Cadastro/aprovação de cuidador (ver DEV-NOTES.md 2026-08-14) — a verificação profissional
+// pesada (documentos/COREN/quiz). Desde 2026-08-15 pode ser ligada a uma conta real (`usuarioId`,
+// preenchido quando enviada por alguém autenticado); nesse caso o resultado é espelhado no
+// `Cuidador` correspondente (ver rota `/cuidadores-cadastro`). `statusVerificacao` é decidido por
+// um motor de regras automático (src/validacao/), sem aprovação manual — ver
+// src/validacao/regras.ts e providers.ts (CPF/antecedentes/COREN hoje são adaptadores mock,
+// provedor pago ainda não contratado, ver INTEGRACOES-EXTERNAS.md #5). `cpf` é único para
+// permitir reenvio (upsert) depois de corrigir.
+model CadastroCuidador {
+  id                String                     @id @default(cuid())
+  usuarioId         String?                    @unique
+  usuario           Usuario?                   @relation(fields: [usuarioId], references: [id], onDelete: SetNull)
+  nome              String
+  cpf               String                     @unique
+  telefone          String
+  email             String
+  categoria         CategoriaCuidador
+  corenNumero       String?
+  chavePix          String
+  statusVerificacao StatusVerificacaoCadastro  @default(em_analise)
+  motivos           String[]
+  criadoEm          DateTime                   @default(now())
+  atualizadoEm      DateTime                   @updatedAt
+
+  documentos    CadastroDocumento[]
+  quizRespostas CadastroQuizResposta[]
+
+  @@map("cadastros_cuidador")
+}
+
+// Só registra que o tipo de documento foi enviado — ainda não há object storage real (ver
+// INTEGRACOES-EXTERNAS.md #7), mesmo mock por presença que já existia na tela, agora persistido.
+model CadastroDocumento {
+  id         String                @id @default(cuid())
+  cadastroId String
+  cadastro   CadastroCuidador      @relation(fields: [cadastroId], references: [id], onDelete: Cascade)
+  tipo       TipoDocumentoCadastro
+  enviadoEm  DateTime              @default(now())
+
+  @@map("cadastro_documentos")
+}
+
+// Respostas do quiz de aptidão (ver CuidadorCadastroScreen.tsx) — `correta`/`critica` vêm
+// calculadas pelo próprio app e só são persistidas aqui, não recalculadas a partir de um banco de
+// perguntas no back-end (mesmo nível de confiança do resto do protótipo, sem autenticação real).
+model CadastroQuizResposta {
+  id         String           @id @default(cuid())
+  cadastroId String
+  cadastro   CadastroCuidador @relation(fields: [cadastroId], references: [id], onDelete: Cascade)
+  questaoId  String
+  respostaId String
+  correta    Boolean
+  critica    Boolean
+
+  @@map("cadastro_quiz_respostas")
+}
+
+enum TipoUsuario {
+  membro
+  cuidador
+}
+
+enum StatusDocumentoMembro {
+  pendente
+  verificado
+}
+
+// Perfil estendido da conta de membro (o que era `DadosPessoais` no AppContext). Nome, e-mail,
+// telefone e CPF ficam em `Usuario` — aqui só o que é específico de quem recebe cuidado.
+//
+// ⚠️ `endereco` é texto livre, como o app coleta hoje. O BACKEND-ARQUITETURA.md §3.2 prevê uma
+// tabela `Endereco` estruturada (logradouro/número/.../lat/long) porque o endereço é o ponto fixo
+// contra o qual a posição do cuidador é comparada — isso depende de geocodificação, cujo provedor
+// ainda não foi contratado (INTEGRACOES-EXTERNAS.md #2). Quando entrar, este campo vira aquela
+// tabela.
+model Membro {
+  id              String                @id @default(cuid())
+  usuarioId       String                @unique
+  usuario         Usuario               @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+  idade           Int?
+  fotoUrl         String?
+  endereco        String?
+  // Lista simples (só nomes), como as condições — mas fica aqui e não em tabela própria porque o
+  // app ainda não tem tela para o membro editar alergias; hoje elas só são exibidas ao cuidador.
+  alergias        String[]
+  documentoStatus StatusDocumentoMembro @default(pendente)
+  criadoEm        DateTime              @default(now())
+  atualizadoEm    DateTime              @updatedAt
+
+  condicoesMedicas   CondicaoMedica[]
+  medicamentos       Medicamento[]
+  contatosEmergencia ContatoEmergencia[]
+
+  @@map("membros")
+}
+
+model CondicaoMedica {
+  id       String @id @default(cuid())
+  membroId String
+  membro   Membro @relation(fields: [membroId], references: [id], onDelete: Cascade)
+  nome     String
+
+  @@index([membroId])
+  @@map("condicoes_medicas")
+}
+
+// `horarios` como lista de strings ("08:00") em vez da tabela `MedicamentoHorario` do
+// BACKEND-ARQUITETURA.md §3.2: são poucos valores por medicamento, sem atributo próprio nenhum, e
+// é exatamente o formato que o app já usa. Se um dia cada horário precisar de dado próprio
+// (confirmação de que foi tomado, por exemplo), aí sim vira tabela.
+model Medicamento {
+  id       String   @id @default(cuid())
+  membroId String
+  membro   Membro   @relation(fields: [membroId], references: [id], onDelete: Cascade)
+  nome     String
+  dosagem  String
+  horarios String[]
+  ativo    Boolean  @default(true)
+
+  @@index([membroId])
+  @@map("medicamentos")
+}
+
+// `aceitaWhatsapp`/`acompanharLocalizacao` do BACKEND-ARQUITETURA.md §3.2 ficaram de fora: dependem
+// da integração de WhatsApp, que ainda não tem rota decidida (INTEGRACOES-EXTERNAS.md #2).
+model ContatoEmergencia {
+  id        String  @id @default(cuid())
+  membroId  String
+  membro    Membro  @relation(fields: [membroId], references: [id], onDelete: Cascade)
+  nome      String
+  relacao   String
+  telefone  String
+  principal Boolean @default(false)
+
+  @@index([membroId])
+  @@map("contatos_emergencia")
+}
+
+// Login real (ver DEV-NOTES.md 2026-08-15) — antes disso não existia conta persistida em lugar
+// nenhum (LoginScreen/CuidadorLoginScreen eram só navegação, sem checar nada). `cpf` é opcional de
+// propósito: pedido do usuário pra não travar o cadastro atrás de campos que ainda vão passar por
+// validação (isso fica pra `CadastroCuidador`/verificação profissional, que é opcional agora).
+model Usuario {
+  id            String    @id @default(cuid())
+  tipo          TipoUsuario
+  nome          String
+  email         String    @unique
+  senhaHash     String
+  telefone      String
+  cpf           String?   @unique
+  // Cliente correspondente na Asaas (`cus_...`), criado na primeira cobrança do membro.
+  asaasClienteId String?  @unique
+  // Foto de perfil. Profissional: a selfie da verificação profissional (só câmera). Membro: câmera
+  // ou galeria em Meu Perfil (2026-09-30). Chave do arquivo no armazenamento (ex.: "perfil/<uuid>.jpg"); é
+  // espelhada em `Profissional.foto` e `Membro.fotoUrl`, que são o que as telas já leem.
+  fotoPerfil    String?
+  fotoPerfilEm  DateTime?
+  // Aceite dos termos no cadastro (2026-10-22): qual versão (`VERSAO_TERMOS` do app, a data do
+  // documento, ex. "2026-10-16") e quando. Membro aceita Termo de Uso + Termo do Contratante +
+  // Política de Privacidade; cuidador, Termo de Uso + Termo do Prestador + Política. Contas criadas
+  // antes disso ficam nulas (aceitaram o rascunho antigo, que não era registrado).
+  termosVersao    String?
+  termosAceitosEm DateTime?
+  criadoEm      DateTime  @default(now())
+  ultimoLoginEm DateTime?
+
+  sessoes            SessaoDispositivo[]
+  cuidador           Cuidador?
+  cadastroCuidador   CadastroCuidador?
+  solicitacoes       Solicitacao[]
+  perfilProfissional Profissional?
+  membro             Membro?
+
+  @@map("usuarios")
+}
+
+// Uma sessão de login por aparelho/login — só o hash do token fica no banco (mesmo padrão já
+// desenhado em BACKEND-ARQUITETURA.md §3.1 pra `refresh_token_hash`). `revogadoEm` marca logout.
+model SessaoDispositivo {
+  id         String    @id @default(cuid())
+  usuarioId  String
+  usuario    Usuario   @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique
+  criadoEm   DateTime  @default(now())
+  revogadoEm DateTime?
+
+  @@map("sessoes_dispositivo")
+}
+
+// Perfil de cuidador ligado a uma conta real — leve de propósito (só `categoria` é obrigatório
+// além da conta). `corenNumero`/`chavePix` e o `statusVerificacao` de verdade (motor de regras)
+// vêm de completar a verificação profissional em `CadastroCuidador` (opcional, feita depois pelo
+// painel) — quando aprovada, os campos aqui são sincronizados a partir de lá.
+model Cuidador {
+  id                String                     @id @default(cuid())
+  usuarioId         String                     @unique
+  usuario           Usuario                    @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+  categoria         CategoriaCuidador
+  corenNumero       String?
+  chavePix          String?
+  statusVerificacao StatusVerificacaoCadastro  @default(em_analise)
+  motivos           String[]
+  // Senha de 6 dígitos exigida em todo resgate (2026-09-30). Só o hash bcrypt fica guardado — não
+  // dá pra "ver" a senha depois; esqueceu = criar uma nova (fluxo por e-mail pendente).
+  senhaResgateHash         String?
+  // Proteção contra tentativa e erro: 5 erros seguidos bloqueiam o resgate por 15 minutos.
+  senhaResgateTentativas   Int       @default(0)
+  senhaResgateBloqueadaAte DateTime?
+  criadoEm          DateTime                   @default(now())
+  atualizadoEm      DateTime                   @updatedAt
+
+  resgates Resgate[]
+
+  @@map("cuidadores")
+}

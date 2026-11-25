@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vidaplena
+      POSTGRES_PASSWORD: vidaplena
+      POSTGRES_DB: vidaplena
+    ports:
+      - "5434:5432"
+    volumes:
+      - vida_plena_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  vida_plena_postgres_data:

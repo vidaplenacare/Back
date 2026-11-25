@@ -1,0 +1,5 @@
+node_modules
+dist
+.env
+# Fotos enviadas pelo app (temporário até o Cloudflare R2 — ver src/lib/armazenamento.ts)
+uploads
